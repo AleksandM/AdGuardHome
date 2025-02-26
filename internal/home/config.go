@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/AdguardTeam/AdGuardHome/internal/aghalg"
+	"github.com/AdguardTeam/AdGuardHome/internal/aghos"
 	"github.com/AdguardTeam/AdGuardHome/internal/aghtls"
 	"github.com/AdguardTeam/AdGuardHome/internal/configmigrate"
 	"github.com/AdguardTeam/AdGuardHome/internal/dhcpd"
@@ -26,12 +27,21 @@ import (
 	yaml "gopkg.in/yaml.v3"
 )
 
-// dataDir is the name of a directory under the working one to store some
-// persistent data.
-const dataDir = "data"
+const (
+	// dataDir is the name of a directory under the working one to store some
+	// persistent data.
+	dataDir = "data"
+
+	// userFilterDataDir is the name of the directory used to store users'
+	// FS-based rule lists.
+	userFilterDataDir = "userfilters"
+)
 
 // logSettings are the logging settings part of the configuration file.
 type logSettings struct {
+	// Enabled indicates whether logging is enabled.
+	Enabled bool `yaml:"enabled"`
+
 	// File is the path to the log file.  If empty, logs are written to stdout.
 	// If "syslog", logs are written to syslog.
 	File string `yaml:"file"`
@@ -152,6 +162,12 @@ type configuration struct {
 	// SchemaVersion is the version of the configuration schema.  See
 	// [configmigrate.LastSchemaVersion].
 	SchemaVersion uint `yaml:"schema_version"`
+
+	// UnsafeUseCustomUpdateIndexURL is the URL to the custom update index.
+	//
+	// NOTE: It's only exists for testing purposes and should not be used in
+	// release.
+	UnsafeUseCustomUpdateIndexURL bool `yaml:"unsafe_use_custom_update_index_url,omitempty"`
 }
 
 // httpConfig is a block with HTTP configuration params.
@@ -203,15 +219,24 @@ type dnsConfig struct {
 	// resolver should be used.
 	PrivateNets []netutil.Prefix `yaml:"private_networks"`
 
-	// UsePrivateRDNS defines if the PTR requests for unknown addresses from
-	// locally-served networks should be resolved via private PTR resolvers.
+	// UsePrivateRDNS enables resolving requests containing a private IP address
+	// using private reverse DNS resolvers.  See PrivateRDNSResolvers.
+	//
+	// TODO(e.burkov):  Rename in YAML.
 	UsePrivateRDNS bool `yaml:"use_private_ptr_resolvers"`
 
-	// LocalPTRResolvers is the slice of addresses to be used as upstreams
-	// for PTR queries for locally-served networks.
-	LocalPTRResolvers []string `yaml:"local_ptr_upstreams"`
+	// PrivateRDNSResolvers is the slice of addresses to be used as upstreams
+	// for private requests.  It's only used for PTR, SOA, and NS queries,
+	// containing an ARPA subdomain, came from the the client with private
+	// address.  The address considered private according to PrivateNets.
+	//
+	// If empty, the OS-provided resolvers are used for private requests.
+	PrivateRDNSResolvers []string `yaml:"local_ptr_upstreams"`
 
-	// UseDNS64 defines if DNS64 should be used for incoming requests.
+	// UseDNS64 defines if DNS64 should be used for incoming requests.  Requests
+	// of type PTR for addresses within the configured prefixes will be resolved
+	// via [PrivateRDNSResolvers], so those should be valid and UsePrivateRDNS
+	// be set to true.
 	UseDNS64 bool `yaml:"use_dns64"`
 
 	// DNS64Prefixes is the list of NAT64 prefixes to be used for DNS64.
@@ -314,7 +339,7 @@ var config = &configuration{
 	AuthBlockMin: 15,
 	HTTPConfig: httpConfig{
 		Address:    netip.AddrPortFrom(netip.IPv4Unspecified(), 3000),
-		SessionTTL: timeutil.Duration{Duration: 30 * timeutil.Day},
+		SessionTTL: timeutil.Duration(30 * timeutil.Day),
 		Pprof: &httpPprofConfig{
 			Enabled: false,
 			Port:    6060,
@@ -330,9 +355,7 @@ var config = &configuration{
 			RefuseAny:              true,
 			UpstreamMode:           dnsforward.UpstreamModeLoadBalance,
 			HandleDDR:              true,
-			FastestTimeout: timeutil.Duration{
-				Duration: fastip.DefaultPingWaitTimeout,
-			},
+			FastestTimeout:         timeutil.Duration(fastip.DefaultPingWaitTimeout),
 
 			TrustedProxies: []netutil.Prefix{{
 				Prefix: netip.MustParsePrefix("127.0.0.0/8"),
@@ -353,7 +376,7 @@ var config = &configuration{
 			// was later increased to 300 due to https://github.com/AdguardTeam/AdGuardHome/issues/2257
 			MaxGoroutines: 300,
 		},
-		UpstreamTimeout:  timeutil.Duration{Duration: dnsforward.DefaultTimeout},
+		UpstreamTimeout:  timeutil.Duration(dnsforward.DefaultTimeout),
 		UsePrivateRDNS:   true,
 		ServePlainDNS:    true,
 		HostsFileEnabled: true,
@@ -366,17 +389,17 @@ var config = &configuration{
 	QueryLog: queryLogConfig{
 		Enabled:     true,
 		FileEnabled: true,
-		Interval:    timeutil.Duration{Duration: 90 * timeutil.Day},
+		Interval:    timeutil.Duration(90 * timeutil.Day),
 		MemSize:     1000,
 		Ignored:     []string{},
 	},
 	Stats: statsConfig{
 		Enabled:  true,
-		Interval: timeutil.Duration{Duration: 1 * timeutil.Day},
+		Interval: timeutil.Duration(1 * timeutil.Day),
 		Ignored:  []string{},
 	},
 	// NOTE: Keep these parameters in sync with the one put into
-	// client/src/helpers/filters/filters.js by scripts/vetted-filters.
+	// client/src/helpers/filters/filters.ts by scripts/vetted-filters.
 	//
 	// TODO(a.garipov): Think of a way to make scripts/vetted-filters update
 	// these as well if necessary.
@@ -411,6 +434,7 @@ var config = &configuration{
 			Enabled:    false,
 			Bing:       true,
 			DuckDuckGo: true,
+			Ecosia:     true,
 			Google:     true,
 			Pixabay:    true,
 			Yandex:     true,
@@ -445,11 +469,14 @@ var config = &configuration{
 		},
 	},
 	Log: logSettings{
-		Compress:   false,
-		LocalTime:  false,
+		Enabled:    true,
+		File:       "",
 		MaxBackups: 0,
 		MaxSize:    100,
 		MaxAge:     3,
+		Compress:   false,
+		LocalTime:  false,
+		Verbose:    false,
 	},
 	OSConfig:      &osConfig{},
 	SchemaVersion: configmigrate.LastSchemaVersion,
@@ -459,9 +486,9 @@ var config = &configuration{
 // configFilePath returns the absolute path to the symlink-evaluated path to the
 // current config file.
 func configFilePath() (confPath string) {
-	confPath, err := filepath.EvalSymlinks(Context.confFilePath)
+	confPath, err := filepath.EvalSymlinks(globalContext.confFilePath)
 	if err != nil {
-		confPath = Context.confFilePath
+		confPath = globalContext.confFilePath
 		logFunc := log.Error
 		if errors.Is(err, os.ErrNotExist) {
 			logFunc = log.Debug
@@ -471,7 +498,7 @@ func configFilePath() (confPath string) {
 	}
 
 	if !filepath.IsAbs(confPath) {
-		confPath = filepath.Join(Context.workDir, confPath)
+		confPath = filepath.Join(globalContext.workDir, confPath)
 	}
 
 	return confPath
@@ -503,7 +530,8 @@ func parseConfig() (err error) {
 	}
 
 	migrator := configmigrate.New(&configmigrate.Config{
-		WorkingDir: Context.workDir,
+		WorkingDir: globalContext.workDir,
+		DataDir:    globalContext.getDataDir(),
 	})
 
 	var upgraded bool
@@ -518,7 +546,7 @@ func parseConfig() (err error) {
 		confPath := configFilePath()
 		log.Debug("writing config file %q after config upgrade", confPath)
 
-		err = maybe.WriteFile(confPath, config.fileData, 0o644)
+		err = maybe.WriteFile(confPath, config.fileData, aghos.DefaultPermFile)
 		if err != nil {
 			return fmt.Errorf("writing new config: %w", err)
 		}
@@ -535,8 +563,8 @@ func parseConfig() (err error) {
 		return err
 	}
 
-	if config.DNS.UpstreamTimeout.Duration == 0 {
-		config.DNS.UpstreamTimeout = timeutil.Duration{Duration: dnsforward.DefaultTimeout}
+	if config.DNS.UpstreamTimeout == 0 {
+		config.DNS.UpstreamTimeout = timeutil.Duration(dnsforward.DefaultTimeout)
 	}
 
 	// Do not wrap the error because it's informative enough as is.
@@ -616,61 +644,62 @@ func (c *configuration) write() (err error) {
 	c.Lock()
 	defer c.Unlock()
 
-	if Context.auth != nil {
-		config.Users = Context.auth.usersList()
+	if globalContext.auth != nil {
+		config.Users = globalContext.auth.usersList()
 	}
 
-	if Context.tls != nil {
+	if globalContext.tls != nil {
 		tlsConf := tlsConfigSettings{}
-		Context.tls.WriteDiskConfig(&tlsConf)
+		globalContext.tls.WriteDiskConfig(&tlsConf)
 		config.TLS = tlsConf
 	}
 
-	if Context.stats != nil {
+	if globalContext.stats != nil {
 		statsConf := stats.Config{}
-		Context.stats.WriteDiskConfig(&statsConf)
-		config.Stats.Interval = timeutil.Duration{Duration: statsConf.Limit}
+		globalContext.stats.WriteDiskConfig(&statsConf)
+		config.Stats.Interval = timeutil.Duration(statsConf.Limit)
 		config.Stats.Enabled = statsConf.Enabled
 		config.Stats.Ignored = statsConf.Ignored.Values()
 	}
 
-	if Context.queryLog != nil {
+	if globalContext.queryLog != nil {
 		dc := querylog.Config{}
-		Context.queryLog.WriteDiskConfig(&dc)
+		globalContext.queryLog.WriteDiskConfig(&dc)
 		config.DNS.AnonymizeClientIP = dc.AnonymizeClientIP
 		config.QueryLog.Enabled = dc.Enabled
 		config.QueryLog.FileEnabled = dc.FileEnabled
-		config.QueryLog.Interval = timeutil.Duration{Duration: dc.RotationIvl}
+		config.QueryLog.Interval = timeutil.Duration(dc.RotationIvl)
 		config.QueryLog.MemSize = dc.MemSize
 		config.QueryLog.Ignored = dc.Ignored.Values()
 	}
 
-	if Context.filters != nil {
-		Context.filters.WriteDiskConfig(config.Filtering)
+	if globalContext.filters != nil {
+		globalContext.filters.WriteDiskConfig(config.Filtering)
 		config.Filters = config.Filtering.Filters
 		config.WhitelistFilters = config.Filtering.WhitelistFilters
 		config.UserRules = config.Filtering.UserRules
 	}
 
-	if s := Context.dnsServer; s != nil {
+	if s := globalContext.dnsServer; s != nil {
 		c := dnsforward.Config{}
 		s.WriteDiskConfig(&c)
 		dns := &config.DNS
 		dns.Config = c
 
-		dns.LocalPTRResolvers = s.LocalPTRResolvers()
+		dns.PrivateRDNSResolvers = s.LocalPTRResolvers()
 
 		addrProcConf := s.AddrProcConfig()
 		config.Clients.Sources.RDNS = addrProcConf.UseRDNS
 		config.Clients.Sources.WHOIS = addrProcConf.UseWHOIS
 		dns.UsePrivateRDNS = addrProcConf.UsePrivateRDNS
+		dns.UpstreamTimeout = timeutil.Duration(s.UpstreamTimeout())
 	}
 
-	if Context.dhcpServer != nil {
-		Context.dhcpServer.WriteDiskConfig(config.DHCP)
+	if globalContext.dhcpServer != nil {
+		globalContext.dhcpServer.WriteDiskConfig(config.DHCP)
 	}
 
-	config.Clients.Persistent = Context.clients.forConfig()
+	config.Clients.Persistent = globalContext.clients.forConfig()
 
 	confPath := configFilePath()
 	log.Debug("writing config file %q", confPath)
@@ -684,7 +713,7 @@ func (c *configuration) write() (err error) {
 		return fmt.Errorf("generating config file: %w", err)
 	}
 
-	err = maybe.WriteFile(confPath, buf.Bytes(), 0o644)
+	err = maybe.WriteFile(confPath, buf.Bytes(), aghos.DefaultPermFile)
 	if err != nil {
 		return fmt.Errorf("writing config file: %w", err)
 	}
@@ -697,14 +726,14 @@ func setContextTLSCipherIDs() (err error) {
 	if len(config.TLS.OverrideTLSCiphers) == 0 {
 		log.Info("tls: using default ciphers")
 
-		Context.tlsCipherIDs = aghtls.SaferCipherSuites()
+		globalContext.tlsCipherIDs = aghtls.SaferCipherSuites()
 
 		return nil
 	}
 
 	log.Info("tls: overriding ciphers: %s", config.TLS.OverrideTLSCiphers)
 
-	Context.tlsCipherIDs, err = aghtls.ParseCiphers(config.TLS.OverrideTLSCiphers)
+	globalContext.tlsCipherIDs, err = aghtls.ParseCiphers(config.TLS.OverrideTLSCiphers)
 	if err != nil {
 		return fmt.Errorf("parsing override ciphers: %w", err)
 	}
